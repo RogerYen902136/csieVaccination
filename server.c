@@ -1,10 +1,3 @@
-/**
- * Programming Assignment 1 - csieVaccination
- * System Programming, Fall 2021, National Taiwan University
- *
- * @author	rogeryen
- */
-
 #include <arpa/inet.h>
 #include <ctype.h>
 #include <errno.h>
