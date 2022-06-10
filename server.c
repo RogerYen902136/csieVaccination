@@ -81,18 +81,18 @@ main(int argc, char *argv[]) {
 	}
 
 	struct sockaddr_in 	cliaddr;	/* used by accept() */
-	socklen_t 			clilen;
+	socklen_t 	  	clilen;
 
 	int 	conn_fd;	/* fd for a new connection with client */
 	int 	file_fd;  	/* fd for file that we open for reading */
 	char 	buf[512];
 
-	fd_set			mset;	/* master fd_set */
-	fd_set  		wset;	/* working fd_set */
+	fd_set	mset;	/* master fd_set */
+	fd_set  wset;	/* working fd_set */
 
-	struct flock 	lock;			/* used for file locking */
-	off_t 			currpos;		/* used for lseek() and file locking */
-	int 			wr_locked[20] = {0};
+	struct flock 	lock;		/* used for file locking */
+	off_t 		currpos;	/* used for lseek() and file locking */
+	int 		wr_locked[20] = {0};
 
 	/* Initialize server. */
 	init_server((unsigned short) strtol(argv[1], NULL, 10));
@@ -287,7 +287,7 @@ main(int argc, char *argv[]) {
 static void
 init_server(unsigned short port) {
 	struct sockaddr_in 	servaddr;
-	int 				tmp;
+	int 			tmp;
 
 	gethostname(svr.hostname, sizeof(svr.hostname));
 	svr.port = port;
