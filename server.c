@@ -26,18 +26,18 @@ typedef struct {
 } registerRecord;
 
 typedef struct {
-	char 			hostname[512];	/* server's hostname */
-	unsigned short	port;			/* port to listen */
-	int 			listen_fd;		/* fd to wait for a new connection */
+	char 		hostname[512];	/* server's hostname */
+	unsigned short	port;		/* port to listen */
+	int 		listen_fd;	/* fd to wait for a new connection */
 } server;
 
 typedef struct {
-	char 			host[512];  	/* client's host */
-	int 			conn_fd;  		/* fd to talk with client */
-	char 			buf[512];  		/* data sent by/to client */
-	size_t 			buf_len;  		/* bytes used by buf */
-	int 			id;
-	int 			wait_for_write; /* used by handle_read to know if the header is read or not */
+	char 		host[512];  	/* client's host */
+	int 		conn_fd;  	/* fd to talk with client */
+	char 		buf[512];  	/* data sent by/to client */
+	size_t 		buf_len; 	/* bytes used by buf */
+	int 		id;
+	int 		wait_for_write; /* used by handle_read to know if the header is read or not */
 	registerRecord 	record;
 } request;
 
