@@ -107,8 +107,7 @@ main(int argc, char *argv[]) {
 	}
 
 	/* Loop for handling connections. */
-	fprintf(stderr, "\nstarting on %.80s, port %d, fd %d, maxconn %d...\n",
-			svr.hostname, svr.port, svr.listen_fd, maxfd);
+	fprintf(stderr, "\nstarting on %.80s, port %d, fd %d, maxconn %d...\n", svr.hostname, svr.port, svr.listen_fd, maxfd);
 
 	while (1) {
 		/* Apply I/O multiplexing using select(). */
