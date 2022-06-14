@@ -1,10 +1,9 @@
 /**
- * Programming Assignment 1 - csieVaccination
- * System Programming, Fall 2021, National Taiwan University
- *
+ * NTU System Programming, Fall 2021, Programming Assignment #1: csieVaccination
+ * 
  * @author rogeryen
+ * @date   June 14th, 2022
  */
-
 #include <arpa/inet.h>
 #include <ctype.h>
 #include <errno.h>
@@ -16,433 +15,421 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-#define ERR_EXIT(a) do { perror(a); exit(EXIT_FAILURE); } while (0)
+// ============================ Error Handlers ============================
+
+/* Handle usage errors. */
+static void
+usageErr(const char *progName) {
+        fprintf(stderr, "usage: %s port\n", progName);
+        exit(EXIT_FAILURE);
+}
+
+/* Handle system/function call errors. */
+static void
+errExit(const char *errMsg) {
+        perror(errMsg);
+        exit(EXIT_FAILURE);
+}
+
+// ========================================================================
+// ============================== Structures ==============================
 
 typedef struct {
-	int id;		/* 902001 - 902020 */
-	int AZ;
-	int BNT;
-	int Moderna;
-} registerRecord;
+        int id;                    /* 902001 - 902020 */
+        int AZ;
+        int BNT;
+        int Moderna;
+} RegisterRecord;
 
 typedef struct {
-	char 		hostname[512];	/* server's hostname */
-	unsigned short	port;		/* port to listen */
-	int 		listen_fd;	/* fd to wait for a new connection */
-} server;
+        char hostname[512];        /* Server's hostname. */
+        unsigned short port;       /* Port to listen. */
+        int listenFd;              /* Fildes to wait for a new connection. */
+} Server;
 
 typedef struct {
-	char 		host[512];  	/* client's host */
-	int 		conn_fd;  	/* fd to talk with client */
-	char 		buf[512];  	/* data sent by/to client */
-	size_t 		buf_len; 	/* bytes used by buf */
-	int 		id;
-	int 		wait_for_write; /* used by handle_read to know if the header is read or not */
-	registerRecord 	record;
-} request;
+        char host[512];            /* Client's host. */
+        int connFd;                /* Fildes to talk with client. */
+        char buf[512];             /* Data sent by/to client. */
+        size_t bufLen;             /* Number of bytes used by buf. */
 
-server	svr;				/* server */
-request *requestP = NULL;	/* point to a list of requests */
-int 	maxfd;				/* size of open file descriptor table, size of request list */
+        int id;                    /* User id. */
+        int waitForWrite;          /* Used for checking which phase of input is currently being handled. */
+        RegisterRecord record;     /* The corresponding registration record. */
+} Request;
 
-/* initialize a server, exit for error */
-static void init_server(unsigned short port);
+// ========================================================================
+// ========================== Function Prototypes =========================
 
-/* initialize a request instance */
-static void init_request(request *reqP);
+/* Initialize a server, exiting if errors occur. */
+static void initServer(unsigned short port);
 
-/* free resources used by a request instance */
-static void free_request(request *reqP);
+/* Initialize a request instance. */
+static void initRequest(Request *reqP);
 
-/* handle input from a client request */
-int handle_read(request *reqP);
+/* Free resources used by a request instance. */
+static void freeRequest(Request *reqP);
 
-/* send message to the file with the given file descriptor */
-void send_msg(int fd, const char *msg);
+/* Handle input from a request instance. */
+static int handleInput(Request *reqP);
 
-/* close the connection from client, and clear the corresponding bit in fd_set */
-void disconnect(request *reqP, fd_set *setP);
+/* Send message to client. */
+static void sendMsg(Request *reqP, const char *msg);
 
-/* check whether user id of a request is valid */
-int id_is_valid(request *reqP);
+/* Close the connection from client. */
+static void disconnect(Request *reqP);
 
-/* store the preference order of a request in buf, with the specified format */
-void get_order(request *reqP, char *buf);
+/* Check the validity of user's id. */
+static int idIsValid(Request *reqP);
 
-/* store the new preference order in buf, with the specified format, retVal indicates whether input order is valid */
-int modify_order(request *reqP, char *buf);
+/* Attempt to set lock on the "registerRecord" file, returning -1 if an error occurs. */
+static int setLock(Request *reqP, short lockType);
+
+/* Send the client his/her preference order. */
+static void sendOrder(Request *reqP);
+
+/* Send the client his/her new preference order, while updating it at the same time. */
+static void updateAndSendOrder(Request *reqP);
+
+// ========================================================================
+
+Server svr;
+Request *requestP;
+int maxFd;
+
+int fileFd;
+fd_set mset, wset;
+int wrLocked[20] = {0};
+
+// ============================= Main Function ============================
 
 int
 main(int argc, char *argv[]) {
-	/* Parse args. */
-	if (argc != 2) {
-		fprintf(stderr, "usage: %s [port]\n", argv[0]);
-		exit(EXIT_FAILURE);
-	}
+        /* Parse arguments. */
+        if (argc != 2) {
+                usageErr(argv[0]);
+        }
 
-	struct sockaddr_in 	cliaddr;	/* used by accept() */
-	socklen_t 	  	clilen;
+        /* Initialize server. */
+        unsigned short port = (unsigned short) strtol(argv[1], NULL, 10);
+        initServer(port);
 
-	int 	conn_fd;	/* fd for a new connection with client */
-	int 	file_fd;  	/* fd for file that we open for reading */
-	char 	buf[512];
+        /* Initialize fd_set's. */
+        FD_ZERO(&mset);
+        FD_SET(svr.listenFd, &mset);
 
-	fd_set	mset;	/* master fd_set */
-	fd_set  wset;	/* working fd_set */
+        /* Open "registerRecord" file. */
+        fileFd = open("registerRecord", O_RDWR);
+        if (fileFd == -1) {
+                errExit("open");
+        }
 
-	struct flock 	lock;		/* used for file locking */
-	off_t 		currpos;	/* used for lseek() and file locking */
-	int 		wr_locked[20] = {0};
+        /* Loop for handling connections. */
+        fprintf(stderr, "\nstarting on %.80s, port %d, fd %d, maxconn %d...\n", svr.hostname, svr.port, svr.listenFd, maxFd);
+        while (1) {
+                /* Apply I/O multiplexing. */
+                memcpy(&wset, &mset, sizeof(mset));
+                if (select(maxFd, &wset, NULL, NULL, NULL) == -1) {
+                        errExit("select");
+                }
 
-	/* Initialize server. */
-	init_server((unsigned short) strtol(argv[1], NULL, 10));
+                int connFd;  /* Fildes for a new connection with client. */
 
-	/* Initialize master fd_set. */
-	FD_ZERO(&mset);
-	FD_SET(svr.listen_fd, &mset);
+                if (FD_ISSET(svr.listenFd, &wset)) {
+                        struct sockaddr_in cliaddr;
+                        socklen_t clilen = sizeof(cliaddr);
 
-	/* Open registerRecord file. */
-	if ((file_fd = open("registerRecord", O_RDWR)) < 0) {
-		ERR_EXIT("open");
-	}
+                        /* Check new connection. */
+                        connFd = accept(svr.listenFd, (struct sockaddr *) &cliaddr, &clilen);
+                        if (connFd == -1) {
+                                if (errno == EINTR || errno == EAGAIN || errno == ENFILE) {
+                                        if (errno == ENFILE) {
+                                                fprintf(stderr, "out of file descriptor table ... (maxconn %d)\n", maxFd);
+                                        }
+                                        continue;
+                                }
+                                errExit("accept");
+                        }
 
-	/* Loop for handling connections. */
-	fprintf(stderr, "\nstarting on %.80s, port %d, fd %d, maxconn %d...\n", svr.hostname, svr.port, svr.listen_fd, maxfd);
+                        requestP[connFd].connFd = connFd;
+                        strcpy(requestP[connFd].host, inet_ntoa(cliaddr.sin_addr));
+                        fprintf(stderr, "getting a new request... fd %d from %s\n", connFd, requestP[connFd].host);
 
-	while (1) {
-		/* Apply I/O multiplexing using select(). */
-		memcpy(&wset, &mset, sizeof(mset));
-		if (select(maxfd, &wset, NULL, NULL, NULL) < 0) {
-			ERR_EXIT("select");
-		}
+                        FD_SET(connFd, &mset);
+                        sendMsg(&requestP[connFd], "Please enter your id (to check your preference order):\n");
+                        continue;
+                }
 
-		for (int i = 0; i < maxfd; i++) {
-			if (!FD_ISSET(i, &wset)) {
-				continue;
-			}
+                /* Find a client that is ready. */
+                connFd = -1;
+                for (int i = 3; i < maxFd; i++) {
+                        if (i != svr.listenFd && FD_ISSET(i, &wset)) {
+                                connFd = i;
+                                break;
+                        }
+                }
+                if (connFd == -1) {
+                        continue;
+                }
 
-			if (i == svr.listen_fd) {
-				/* Check new connection. */
-				clilen = sizeof(cliaddr);
-				if ((conn_fd = accept(svr.listen_fd, (struct sockaddr *) &cliaddr, &clilen)) < 0) {
-					if (errno == EINTR || errno == EAGAIN) {
-						continue;	/* try again */
-					}
-					if (errno == ENFILE) {
-						fprintf(stderr, "out of file descriptor table ... (maxconn %d)\n", maxfd);
-						continue;
-					}
-					ERR_EXIT("accept");
-				}
+                Request *reqP = &requestP[connFd];
 
-				requestP[conn_fd].conn_fd = conn_fd;
-				strcpy(requestP[conn_fd].host, inet_ntoa(cliaddr.sin_addr));
-				fprintf(stderr, "getting a new request... fd %d from %s\n", conn_fd, requestP[conn_fd].host);
+                /* Handle request from client. */
+                int ret = handleInput(reqP);
+                if (ret == -1) {
+                        fprintf(stderr, "bad request from %s\n", (*reqP).host);
+                        disconnect(reqP);
+                        continue;
+                }
 
-				FD_SET(conn_fd, &mset);
-				send_msg(conn_fd, "Please enter your id (to check your preference order):\n");
-
-			} else {
-				int ret = handle_read(&requestP[i]);	/* Parse data from client to requestP[i].buf. */
-				if (ret < 0) {
-					fprintf(stderr, "bad request from %s\n", requestP[conn_fd].host);
-					disconnect(&requestP[i], &mset);
-					continue;
-				}
-
-				/* Handle requests from clients. */
 #ifdef READ_SERVER
-				/* Check whether input id is valid. */
-				if (!id_is_valid(&requestP[i])) {
-					send_msg(requestP[i].conn_fd, "[Error] Operation failed. Please try again.\n");
-					disconnect(&requestP[i], &mset);
-					break;
-				}
-				currpos = (requestP[i].id - 902001) * (off_t) sizeof(registerRecord);
 
-				/* Acquire read lock and answer request. */
-				lock.l_type = F_RDLCK;
-				lock.l_whence = SEEK_SET;
-				lock.l_start = currpos;
-				lock.l_len = sizeof(registerRecord);
-
-				if (fcntl(file_fd, F_SETLK, &lock) < 0) {
-					if (errno != EAGAIN) {
-						ERR_EXIT("fcntl");
-					}
-					send_msg(requestP[i].conn_fd, "Locked.\n");
-
-				} else {
-					if (lseek(file_fd, currpos, SEEK_SET) < 0) {
-						ERR_EXIT("lseek");
-					}
-					if (read(file_fd, &requestP[i].record, sizeof(registerRecord)) != sizeof(registerRecord)) {
-						ERR_EXIT("read");
-					}
-
-					get_order(&requestP[i], buf);
-					send_msg(requestP[i].conn_fd, buf);
-
-					/* Release read lock. */
-					lock.l_type = F_UNLCK;
-					lock.l_whence = SEEK_SET;
-					lock.l_start = currpos;
-					lock.l_len = sizeof(registerRecord);
-
-					if (fcntl(file_fd, F_SETLK, &lock) < 0) {
-						ERR_EXIT("fcntl");
-					}
-				}
-				disconnect(&requestP[i], &mset);
-				break;
+                if (!idIsValid(reqP)) {
+                        sendMsg(reqP, "[Error] Operation failed. Please try again.\n");
+                } else {
+                        if (setLock(reqP, F_RDLCK) == -1) {
+                                if (errno != EAGAIN) {
+                                        errExit("fcntl");
+                                }
+                                sendMsg(reqP, "Locked.\n");
+                        } else {
+                                sendOrder(reqP);
+                                if (setLock(reqP, F_UNLCK) == -1) {
+                                        errExit("fcntl");
+                                }
+                        }
+                }
+                disconnect(reqP);
 
 #elif defined WRITE_SERVER
-				if (requestP[i].wait_for_write == 0) {
-					/* User id hasn't been obtained. */
-					/* Check whether input id is valid. */
-					if (!id_is_valid(&requestP[i])) {
-						send_msg(requestP[i].conn_fd, "[Error] Operation failed. Please try again.\n");
-						disconnect(&requestP[i], &mset);
-						break;
-					}
-					currpos = (requestP[i].id - 902001) * (off_t) sizeof(registerRecord);
 
-					/* Acquire write lock and answer the 1st half of request. */
-					lock.l_type = F_WRLCK;
-					lock.l_whence = SEEK_SET;
-					lock.l_start = currpos;
-					lock.l_len = sizeof(registerRecord);
+                if ((*reqP).waitForWrite == 0) {
+                        if (!idIsValid(reqP)) {
+                                sendMsg(reqP, "[Error] Operation failed. Please try again.\n");
+                                disconnect(reqP);
+                        } else {
+                                if (setLock(reqP, F_WRLCK) == -1) {
+                                        if (errno != EAGAIN) {
+                                                errExit("fcntl");
+                                        }
+                                        sendMsg(reqP, "Locked.\n");
+                                        disconnect(reqP);
+                                } else if (wrLocked[(*reqP).id - 902001]) {
+                                        sendMsg(reqP, "Locked.\n");
+                                        disconnect(reqP);
+                                } else {
+                                        wrLocked[(*reqP).id - 902001] = 1;
+                                        (*reqP).waitForWrite = 1;
 
-					if (fcntl(file_fd, F_SETLK, &lock) < 0) {
-						if (errno != EAGAIN) {
-							ERR_EXIT("fcntl");
-						}
-						send_msg(requestP[i].conn_fd, "Locked.\n");
-						disconnect(&requestP[i], &mset);
-						break;
-					}
-					if (wr_locked[requestP[i].id - 902001] == 1) {
-						send_msg(requestP[i].conn_fd, "Locked.\n");
-						disconnect(&requestP[i], &mset);
-						break;
-					}
+                                        sendOrder(reqP);
+                                        sendMsg(reqP, "Please input your preference order respectively(AZ,BNT,Moderna):\n");
+                                }
+                        }
+                } else {
+                        updateAndSendOrder(reqP);
 
-					wr_locked[requestP[i].id - 902001] = 1;
-					requestP[i].wait_for_write = 1;
-
-					if (lseek(file_fd, currpos, SEEK_SET) < 0) {
-						ERR_EXIT("lseek");
-					}
-					if (read(file_fd, &requestP[i].record, sizeof(registerRecord)) != sizeof(registerRecord)) {
-						ERR_EXIT("read");
-					}
-
-					get_order(&requestP[i], buf);
-					send_msg(requestP[i].conn_fd, buf);
-					send_msg(requestP[i].conn_fd, "Please input your preference order respectively(AZ,BNT,Moderna):\n");
-					break;
-
-				} else {
-					currpos = (requestP[i].id - 902001) * (off_t) sizeof(registerRecord);
-
-					/* Answer the 2nd half of request, which is to update the preference order. */
-					if (!modify_order(&requestP[i], buf)) {
-						send_msg(requestP[i].conn_fd, "[Error] Operation failed. Please try again.\n");
-					} else {
-						if (lseek(file_fd, currpos, SEEK_SET) < 0) {
-							ERR_EXIT("lseek");
-						}
-						/* Update registerRecord. */
-						if (write(file_fd, &requestP[i].record, sizeof(registerRecord)) != sizeof(registerRecord)) {
-							ERR_EXIT("write");
-						}
-						/* Inform client the update has been done. */
-						send_msg(requestP[i].conn_fd, buf);
-					}
-
-					/* Release write lock. */
-					wr_locked[requestP[i].id - 902001] = 0;
-					lock.l_type = F_UNLCK;
-					lock.l_whence = SEEK_SET;
-					lock.l_start = currpos;
-					lock.l_len = sizeof(registerRecord);
-
-					if (fcntl(file_fd, F_SETLK, &lock) < 0) {
-						ERR_EXIT("fcntl");
-					}
-					disconnect(&requestP[i], &mset);
-					break;
-				}
+                        wrLocked[(*reqP).id - 902001] = 0;
+                        if (setLock(reqP, F_UNLCK) == -1) {
+                                errExit("fcntl");
+                        }
+                        disconnect(reqP);
+                }
 #endif
-			}
-		}
-	}
+        }
 
-	close(file_fd);
-	free(requestP);
-	exit(EXIT_SUCCESS);
+        free(requestP);
+        if (close(fileFd) == -1) {
+                errExit("close");
+        }
+
+        exit(EXIT_SUCCESS);
+}
+
+// ========================================================================
+// ======================== Function Implementations ======================
+
+static void
+initServer(unsigned short port) {
+        struct sockaddr_in servaddr;
+        int tmp;
+
+        gethostname(svr.hostname, sizeof(svr.hostname));
+        svr.port = port;
+        svr.listenFd = socket(AF_INET, SOCK_STREAM, 0);
+        if (svr.listenFd == -1) {
+                errExit("socket");
+        }
+
+        bzero(&servaddr, sizeof(servaddr));
+        servaddr.sin_family = AF_INET;
+        servaddr.sin_addr.s_addr = htonl(INADDR_ANY);
+        servaddr.sin_port = htons(port);
+        tmp = 1;
+
+        if (setsockopt(svr.listenFd, SOL_SOCKET, SO_REUSEADDR, (void *) &tmp, sizeof(tmp)) == -1) {
+                errExit("setsockopt");
+        }
+        if (bind(svr.listenFd, (struct sockaddr *) &servaddr, sizeof(servaddr)) == -1) {
+                errExit("bind");
+        }
+        if (listen(svr.listenFd, 1024) == -1) {
+                errExit("listen");
+        }
+
+        maxFd = getdtablesize();
+        requestP = (Request *) malloc(sizeof(Request) *  maxFd);
+        if (requestP == NULL) {
+                errExit("malloc");
+        }
+        for (int i = 0; i < maxFd; i++) {
+                initRequest(&requestP[i]);
+        }
+        requestP[svr.listenFd].connFd = svr.listenFd;
+        strcpy(requestP[svr.listenFd].host, svr.hostname);
 }
 
 static void
-init_server(unsigned short port) {
-	struct sockaddr_in 	servaddr;
-	int 			tmp;
-
-	gethostname(svr.hostname, sizeof(svr.hostname));
-	svr.port = port;
-
-	if ((svr.listen_fd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
-		ERR_EXIT("socket");
-	}
-
-	bzero(&servaddr, sizeof(servaddr));
-	servaddr.sin_family = AF_INET;
-	servaddr.sin_addr.s_addr = htonl(INADDR_ANY);
-	servaddr.sin_port = htons(port);
-	tmp = 1;
-
-	if (setsockopt(svr.listen_fd, SOL_SOCKET, SO_REUSEADDR, (void *) &tmp, sizeof(tmp)) < 0) {
-		ERR_EXIT("setsockopt");
-	}
-	if (bind(svr.listen_fd, (struct sockaddr *) &servaddr, sizeof(servaddr)) < 0) {
-		ERR_EXIT("bind");
-	}
-	if (listen(svr.listen_fd, 1024) < 0) {
-		ERR_EXIT("listen");
-	}
-
-	// Get file descriptor table size and initialize request table
-	maxfd = getdtablesize();
-	requestP = (request *) malloc(sizeof(request) * maxfd);
-	if (requestP == NULL) {
-		ERR_EXIT("out of memory allocating all requests");
-	}
-	for (int i = 0; i < maxfd; i++) {
-		init_request(&requestP[i]);
-	}
-	requestP[svr.listen_fd].conn_fd = svr.listen_fd;
-	strcpy(requestP[svr.listen_fd].host, svr.hostname);
+initRequest(Request *reqP) {
+        reqP->connFd = -1;
+        reqP->bufLen = 0;
+        reqP->id = 0;
+        reqP->waitForWrite = 0;
+        memset(&reqP->record, 0, sizeof(RegisterRecord));
 }
 
 static void
-init_request(request *reqP) {
-	reqP->conn_fd = -1;
-	reqP->buf_len = 0;
-	reqP->id = 0;
-	reqP->wait_for_write = 0;
-	memset(&reqP->record, 0, sizeof(registerRecord));
+freeRequest(Request *reqP) {
+        initRequest(reqP);
+}
+
+static int
+handleInput(Request *reqP) {
+        ssize_t numRead;
+        char buf[512];
+        if ((numRead = read(reqP->connFd, buf, sizeof(buf))) <= 0) {
+                return (int) numRead;
+        }
+
+        char *ptr = strstr(buf, "\r\n");
+        if (ptr == NULL) {
+                ptr = strstr(buf, "\n");
+                if (ptr == NULL) {
+                        fprintf(stderr, "This really shouldn't have happened.\n");
+                        exit(EXIT_FAILURE);
+                }
+        }
+
+        size_t bufLen = ptr - buf + 1;
+        memmove(reqP->buf, buf, bufLen);
+        reqP->buf[bufLen - 1] = '\0';
+        reqP->bufLen = bufLen - 1;
+
+        return 1;
+}
+
+static inline void
+sendMsg(Request *reqP, const char *msg) {
+        if (write(reqP->connFd, msg, strlen(msg)) != strlen(msg)) {
+                errExit("write");
+        }
 }
 
 static void
-free_request(request *reqP) {
-	init_request(reqP);
+disconnect(Request *reqP) {
+        FD_CLR(reqP->connFd, &mset);
+        if (close(reqP->connFd) == -1) {
+                errExit("close");
+        }
+        freeRequest(reqP);
 }
 
-int
-handle_read(request *reqP) {
-	ssize_t r;
-	char 	buf[512];
-	char 	*p1;
-	size_t 	len;
-
-	if ((r = read(reqP->conn_fd, buf, sizeof(buf))) <= 0) {
-		return r == 0 ? 0 : -1;
-	}
-	if ((p1 = strstr(buf, "\015\012")) == NULL) {
-		if ((p1 = strstr(buf, "\012")) == NULL) {
-			ERR_EXIT("this really should not happen...");
-		}
-	}
-
-	len = p1 - buf + 1;
-	memmove(reqP->buf, buf, len);
-	reqP->buf[len - 1] = '\0';
-	reqP->buf_len = len - 1;
-	return 1;
+static int
+idIsValid(Request *reqP) {
+        if (reqP->bufLen == 6) {
+                if (strcmp("902001", reqP->buf) <= 0 && strcmp(reqP->buf, "902020") <= 0) {
+                        reqP->id = (int) strtol(reqP->buf, NULL, 10);
+                        return 1;
+                }
+        }
+        return 0;
 }
 
-void
-send_msg(int fd, const char *msg) {
-	char buf[512];
+static int
+setLock(Request *reqP, short lockType) {
+        struct flock lock;
+        lock.l_type = lockType;
+        lock.l_whence = SEEK_SET;
+        lock.l_start = (reqP->id - 902001) * (off_t) sizeof(RegisterRecord);
+        lock.l_len = sizeof(RegisterRecord);
 
-	sprintf(buf, "%s", msg);
-	if (write(fd, buf, strlen(buf)) != strlen(buf)) {
-		ERR_EXIT("write");
-	}
+        return fcntl(fileFd, F_SETLK, &lock);
 }
 
-void
-disconnect(request *reqP, fd_set *setP) {
-	FD_CLR(reqP->conn_fd, setP);
-	close(reqP->conn_fd);
-	free_request(reqP);
+static void
+sendOrder(Request *reqP) {
+        if (lseek(fileFd, (reqP->id - 902001) * (off_t) sizeof(RegisterRecord), SEEK_SET) == -1) {
+                errExit("lseek");
+        }
+        if (read(fileFd, &reqP->record, sizeof(reqP->record)) != sizeof(reqP->record)) {
+                errExit("read");
+        }
+
+        char buf[512];
+        sprintf(buf, "Your preference order is %s > %s > %s.\n", 
+                        reqP->record.AZ == 1 ? "AZ" : reqP->record.BNT == 1 ? "BNT" : "Moderna", 
+                        reqP->record.AZ == 2 ? "AZ" : reqP->record.BNT == 2 ? "BNT" : "Moderna", 
+                        reqP->record.AZ == 3 ? "AZ" : reqP->record.BNT == 3 ? "BNT" : "Moderna"
+        );
+        sendMsg(reqP, buf);
 }
 
-int
-id_is_valid(request *reqP) {
-	if (reqP->buf_len == 6) {
-		reqP->id = (int) strtol(reqP->buf, NULL, 10);
-		if (902001 <= reqP->id && reqP->id <= 902020) {
-			return 1;
-		}
-	}
-	return 0;
-}
+char validOrders[6][3] = {{'1', '2', '3'}, 
+                          {'1', '3', '2'}, 
+                          {'2', '1', '3'}, 
+                          {'2', '3', '1'}, 
+                          {'3', '1', '2'}, 
+                          {'3', '2', '1'}};
 
-void
-get_order(request *reqP, char *buf) {
-	sprintf(buf, "Your preference order is %s > %s > %s.\n",
-			reqP->record.AZ == 1 ? "AZ" : reqP->record.BNT == 1 ? "BNT" : "Moderna",
-			reqP->record.AZ == 2 ? "AZ" : reqP->record.BNT == 2 ? "BNT" : "Moderna",
-			reqP->record.AZ == 3 ? "AZ" : reqP->record.BNT == 3 ? "BNT" : "Moderna"
-	);
-}
+static void
+updateAndSendOrder(Request *reqP) {
+        if (reqP->bufLen == 5) {
+                char s1[512], s2[512], s3[512];
 
-int arr[6][3] = {{1, 2, 3},
-				 {1, 3, 2},
-				 {2, 1, 3},
-				 {2, 3, 1},
-				 {3, 1, 2},
-				 {3, 2, 1}};
+                if (sscanf(reqP->buf, "%s%s%s", s1, s2, s3) == 3) {
+                        if (strlen(s1) == 1 && strlen(s2) == 1 && strlen(s3) == 1) {
+                                if (isdigit(s1[0]) && isdigit(s2[0]) && isdigit(s3[0])) {
+                                        int isValid = 0;
+                                        for (int i = 0; i < 6; i++) {
+                                                if (s1[0] == validOrders[i][0] && s2[0] == validOrders[i][1] && s3[0] == validOrders[i][2]) {
+                                                        isValid = 1;
+                                                        break;
+                                                }
+                                        }
 
-int
-modify_order(request *reqP, char *buf) {
-	if (reqP->buf_len == 5) {
-		char s1[512];
-		char s2[512];
-		char s3[512];
+                                        if (isValid) {
+                                                reqP->record.AZ = s1[0] - '0';
+                                                reqP->record.BNT = s2[0] - '0';
+                                                reqP->record.Moderna = s3[0] - '0';
 
-		if (sscanf(reqP->buf, "%s%s%s", s1, s2, s3) == 3) {
-			if (strlen(s1) == 1 && strlen(s2) == 1 && strlen(s3) == 1) {
-				if (isdigit(s1[0]) && isdigit(s2[0]) && isdigit(s3[0])) {
-					int	n1 = s1[0] - '0';
-					int n2 = s2[0] - '0';
-					int n3 = s3[0] - '0';
+                                                if (lseek(fileFd, (reqP->id - 902001) * (off_t) sizeof(reqP->record), SEEK_SET) == -1) {
+                                                        errExit("lseek");
+                                                }
+                                                if (write(fileFd, &reqP->record, sizeof(reqP->record)) != sizeof(reqP->record)) {
+                                                        errExit("write");
+                                                }
 
-					int fl = 0;
-					for (int i = 0; i < 6; i++) {
-						if (n1 == arr[i][0] && n2 == arr[i][1] && n3 == arr[i][2]) {
-							fl = 1;
-							break;
-						}
-					}
-					if (fl) {
-						reqP->record.AZ = n1;
-						reqP->record.BNT = n2;
-						reqP->record.Moderna = n3;
-
-						sprintf(buf, "Preference order for %d modified successed, new preference order is %s > %s > %s.\n",
-								reqP->id,
-								reqP->record.AZ == 1 ? "AZ" : reqP->record.BNT == 1 ? "BNT" : "Moderna",
-								reqP->record.AZ == 2 ? "AZ" : reqP->record.BNT == 2 ? "BNT" : "Moderna",
-								reqP->record.AZ == 3 ? "AZ" : reqP->record.BNT == 3 ? "BNT" : "Moderna"
-						);
-						return 1;
-					}
-				}
-			}
-		}
-	}
-
-	return 0;
+                                                sprintf(s1, "Preference order for %d modified successed, new preference order is %s > %s > %s.\n",
+                                                                reqP->id,
+                                                                reqP->record.AZ == 1 ? "AZ" : reqP->record.BNT == 1 ? "BNT" : "Moderna",
+                                                                reqP->record.AZ == 2 ? "AZ" : reqP->record.BNT == 2 ? "BNT" : "Moderna", 
+                                                                reqP->record.AZ == 3 ? "AZ" : reqP->record.BNT == 3 ? "BNT" : "Moderna"
+                                                );
+                                                sendMsg(reqP, s1);
+                                                return;
+                                        }
+                                }
+                        }
+                }
+        }
+        sendMsg(reqP, "[Error] Operation failed. Please try again.\n");
 }
